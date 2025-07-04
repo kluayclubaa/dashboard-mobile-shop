@@ -4,17 +4,7 @@ import { useState, useEffect, useMemo, type FC, type FormEvent } from "react"
 
 // --- Firebase Imports ---
 import { db, auth } from "@/lib/firebase"
-import {
-  collection,
-  onSnapshot,
-  addDoc,
-  doc,
-  runTransaction,
-  query,
-  orderBy,
-  updateDoc,
-  deleteDoc,
-} from "firebase/firestore"
+import { collection, onSnapshot, addDoc, doc, query, orderBy, updateDoc, deleteDoc } from "firebase/firestore"
 import { onAuthStateChanged, signOut, signInAnonymously, type User } from "firebase/auth"
 
 // --- UI Components ---
@@ -23,6 +13,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
+import { Textarea } from "@/components/ui/textarea"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
   DialogContent,
@@ -48,6 +40,9 @@ import {
   Eye,
   LogOut,
   AlertCircle,
+  FileText,
+  CheckCircle,
+  Clock,
 } from "lucide-react"
 
 // --- TYPE DEFINITIONS ---
@@ -63,18 +58,17 @@ interface StockItem {
   quantity: number
 }
 
-interface UsedItem {
-  stockId: string
-  name: string
-  quantity: number
-}
-
 interface RepairJob {
   id: string
   branchId: string
-  description: string
-  price: number
-  itemsUsed: UsedItem[]
+  customerName: string
+  dateReceived: string
+  symptoms: string
+  estimatedPrice: number
+  isUnderWarranty: boolean
+  technicianName: string
+  expectedCompletionDate: string
+  status: "in_progress" | "completed"
   createdAt: string
 }
 
@@ -87,6 +81,7 @@ type ModalType =
   | "add_repair"
   | "edit_repair"
   | "delete_repair"
+  | "view_receipt"
   | null
 
 interface ModalState {
@@ -143,29 +138,26 @@ export default function IProDashboard() {
   }, [user])
 
   // --- DATA DERIVATION (MEMOIZED) ---
-  const { totalRevenue, totalRepairs, stockSummary, selectedBranchStock, selectedBranchJobs } = useMemo(() => {
-    const totalRevenue = repairJobs.reduce((sum, job) => sum + (job.price || 0), 0)
-    const totalRepairs = repairJobs.length
+  const { totalRevenue, totalRepairs, completedRepairs, inProgressRepairs, selectedBranchStock, selectedBranchJobs } =
+    useMemo(() => {
+      const completedJobs = repairJobs.filter((job) => job.status === "completed")
+      const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.estimatedPrice || 0), 0)
+      const totalRepairs = repairJobs.length
+      const completedRepairs = completedJobs.length
+      const inProgressRepairs = repairJobs.filter((job) => job.status === "in_progress").length
 
-    const stockSummary = stock.reduce(
-      (acc, item) => {
-        acc[item.name] = (acc[item.name] || 0) + item.quantity
-        return acc
-      },
-      {} as { [key: string]: number },
-    )
+      const selectedBranchStock = stock.filter((item) => item.branchId === selectedBranch?.id)
+      const selectedBranchJobs = repairJobs.filter((job) => job.branchId === selectedBranch?.id)
 
-    const selectedBranchStock = stock.filter((item) => item.branchId === selectedBranch?.id)
-    const selectedBranchJobs = repairJobs.filter((job) => job.branchId === selectedBranch?.id)
-
-    return {
-      totalRevenue,
-      totalRepairs,
-      stockSummary,
-      selectedBranchStock,
-      selectedBranchJobs,
-    }
-  }, [repairJobs, stock, selectedBranch])
+      return {
+        totalRevenue,
+        totalRepairs,
+        completedRepairs,
+        inProgressRepairs,
+        selectedBranchStock,
+        selectedBranchJobs,
+      }
+    }, [repairJobs, stock, selectedBranch])
 
   // --- HANDLERS ---
   const handleLogin = async () => {
@@ -229,65 +221,26 @@ export default function IProDashboard() {
   }
 
   const handleAddOrUpdateRepairJob = async (
-    description: string,
-    price: number,
-    itemsUsed: UsedItem[],
+    repairData: Omit<RepairJob, "id" | "branchId" | "createdAt">,
     jobToUpdate?: RepairJob,
   ) => {
-    if (!selectedBranch || !description) {
+    if (!selectedBranch || !repairData.customerName || !repairData.symptoms) {
       return setModalError("กรุณากรอกข้อมูลให้ครบถ้วน")
     }
 
-    const oldMap = new Map<string, number>()
-    jobToUpdate?.itemsUsed.forEach((i) => oldMap.set(i.stockId, i.quantity))
-
-    const newMap = new Map<string, number>()
-    itemsUsed.forEach((i) => newMap.set(i.stockId, i.quantity))
-
-    const allIds = new Set([...oldMap.keys(), ...newMap.keys()])
-
     try {
-      await runTransaction(db, async (tx) => {
-        const stockOps = await Promise.all(
-          Array.from(allIds).map(async (id) => {
-            const ref = doc(db, "stock", id)
-            const snap = await tx.get(ref)
-            if (!snap.exists()) throw new Error(`ไม่พบสินค้า ID: ${id}`)
-
-            const cur = snap.data().quantity as number
-            const oldQ = oldMap.get(id) ?? 0
-            const newQ = newMap.get(id) ?? 0
-            const delta = oldQ - newQ
-
-            if (delta < 0 && cur < -delta) {
-              throw new Error(`สินค้า '${snap.data().name}' ไม่เพียงพอ`)
-            }
-            return { ref, newQty: cur + delta }
-          }),
-        )
-
-        if (jobToUpdate) {
-          tx.update(doc(db, "repairJobs", jobToUpdate.id), {
-            description,
-            price,
-            itemsUsed,
-          })
-        } else {
-          tx.set(doc(collection(db, "repairJobs")), {
-            branchId: selectedBranch.id,
-            description,
-            price,
-            itemsUsed,
-            createdAt: new Date().toISOString(),
-          })
-        }
-
-        stockOps.forEach(({ ref, newQty }) => tx.update(ref, { quantity: newQty }))
-      })
-
+      if (jobToUpdate) {
+        await updateDoc(doc(db, "repairJobs", jobToUpdate.id), repairData)
+      } else {
+        await addDoc(collection(db, "repairJobs"), {
+          ...repairData,
+          branchId: selectedBranch.id,
+          createdAt: new Date().toISOString(),
+        })
+      }
       closeModal()
     } catch (e: any) {
-      console.error("Transaction failed:", e)
+      console.error("Failed to save repair job:", e)
       setModalError(e.message)
     }
   }
@@ -295,28 +248,19 @@ export default function IProDashboard() {
   const handleDeleteRepairJob = async (job: RepairJob) => {
     if (!job) return
     try {
-      await runTransaction(db, async (tx) => {
-        const stockRestorePromises = job.itemsUsed.map(async (item) => {
-          const ref = doc(db, "stock", item.stockId)
-          const snap = await tx.get(ref)
-          if (!snap.exists()) {
-            console.warn(`Stock item ${item.name} (ID: ${item.stockId}) not found for restoration.`)
-            return null
-          }
-          return { ref, newQuantity: snap.data().quantity + item.quantity }
-        })
-        const stockToRestore = (await Promise.all(stockRestorePromises)).filter(Boolean)
-
-        const jobRef = doc(db, "repairJobs", job.id)
-        tx.delete(jobRef)
-        stockToRestore.forEach((update) => {
-          if (update) tx.update(update.ref, { quantity: update.newQuantity })
-        })
-      })
+      await deleteDoc(doc(db, "repairJobs", job.id))
       closeModal()
     } catch (e: any) {
-      console.error("Delete transaction failed:", e)
+      console.error("Delete failed:", e)
       setModalError(e.message)
+    }
+  }
+
+  const handleCompleteRepair = async (job: RepairJob) => {
+    try {
+      await updateDoc(doc(db, "repairJobs", job.id), { status: "completed" })
+    } catch (e: any) {
+      console.error("Failed to complete repair:", e)
     }
   }
 
@@ -351,7 +295,7 @@ export default function IProDashboard() {
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                onKeyPress={(e ) => e.key === "Enter" && handleLogin()}
+                onKeyPress={(e) => e.key === "Enter" && handleLogin()}
                 placeholder="กรุณาใส่รหัสผ่าน"
               />
             </div>
@@ -444,40 +388,40 @@ export default function IProDashboard() {
                 </CardHeader>
                 <CardContent>
                   <div className="text-2xl font-bold">฿{totalRevenue.toLocaleString()}</div>
-                  <p className="text-xs text-muted-foreground">จากงานซ่อมทั้งหมด</p>
+                  <p className="text-xs text-muted-foreground">จากงานซ่อมที่เสร็จแล้ว</p>
                 </CardContent>
               </Card>
 
               <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                  <CardTitle className="text-sm font-medium">จำนวนงานซ่อม</CardTitle>
+                  <CardTitle className="text-sm font-medium">งานซ่อมทั้งหมด</CardTitle>
                   <Wrench className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
                   <div className="text-2xl font-bold">{totalRepairs.toLocaleString()}</div>
-                  <p className="text-xs text-muted-foreground">งานที่เสร็จสิ้นแล้ว</p>
+                  <p className="text-xs text-muted-foreground">รวมทุกสถานะ</p>
                 </CardContent>
               </Card>
 
               <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                  <CardTitle className="text-sm font-medium">จำนวนสาขา</CardTitle>
-                  <Building2 className="h-4 w-4 text-muted-foreground" />
+                  <CardTitle className="text-sm font-medium">งานเสร็จสิ้น</CardTitle>
+                  <CheckCircle className="h-4 w-4 text-green-600" />
                 </CardHeader>
                 <CardContent>
-                  <div className="text-2xl font-bold">{branches.length}</div>
-                  <p className="text-xs text-muted-foreground">สาขาที่เปิดให้บริการ</p>
+                  <div className="text-2xl font-bold">{completedRepairs}</div>
+                  <p className="text-xs text-muted-foreground">งานที่เสร็จแล้ว</p>
                 </CardContent>
               </Card>
 
               <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                  <CardTitle className="text-sm font-medium">รายการสต็อก</CardTitle>
-                  <Package className="h-4 w-4 text-muted-foreground" />
+                  <CardTitle className="text-sm font-medium">กำลังดำเนินการ</CardTitle>
+                  <Clock className="h-4 w-4 text-orange-600" />
                 </CardHeader>
                 <CardContent>
-                  <div className="text-2xl font-bold">{Object.keys(stockSummary).length}</div>
-                  <p className="text-xs text-muted-foreground">ประเภทสินค้าทั้งหมด</p>
+                  <div className="text-2xl font-bold">{inProgressRepairs}</div>
+                  <p className="text-xs text-muted-foreground">งานที่ยังไม่เสร็จ</p>
                 </CardContent>
               </Card>
             </div>
@@ -529,76 +473,48 @@ export default function IProDashboard() {
                 </CardContent>
               </Card>
 
-              {/* Recent Repairs & Stock Summary */}
-              <div className="space-y-6">
-                {/* Recent Repairs */}
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <BarChart3 className="w-5 h-5" />
-                      รายการซ่อมล่าสุด
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-48">
-                      {repairJobs.length > 0 ? (
-                        <div className="space-y-3">
-                          {repairJobs.slice(0, 5).map((job) => (
-                            <div key={job.id} className="flex justify-between items-start p-3 rounded-lg bg-muted/50">
-                              <div className="space-y-1">
-                                <p className="font-medium text-sm">{job.description}</p>
-                                <p className="text-xs text-muted-foreground">
-                                  สาขา: {branches.find((b) => b.id === job.branchId)?.name || "N/A"}
-                                </p>
-                                <p className="text-xs text-muted-foreground">
-                                  {new Date(job.createdAt).toLocaleDateString("th-TH")}
-                                </p>
-                              </div>
-                              <Badge variant="secondary">฿{job.price?.toLocaleString() || 0}</Badge>
+              {/* Recent Repairs */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <BarChart3 className="w-5 h-5" />
+                    รายการซ่อมล่าสุด
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <ScrollArea className="h-96">
+                    {repairJobs.length > 0 ? (
+                      <div className="space-y-3">
+                        {repairJobs.slice(0, 10).map((job) => (
+                          <div key={job.id} className="flex justify-between items-start p-3 rounded-lg bg-muted/50">
+                            <div className="space-y-1">
+                              <p className="font-medium text-sm">{job.customerName}</p>
+                              <p className="text-xs text-muted-foreground">{job.symptoms}</p>
+                              <p className="text-xs text-muted-foreground">
+                                สาขา: {branches.find((b) => b.id === job.branchId)?.name || "N/A"}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                {new Date(job.dateReceived).toLocaleDateString("th-TH")}
+                              </p>
                             </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="text-center py-8 text-muted-foreground">
-                          <Wrench className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                          <p className="text-sm">ยังไม่มีรายการซ่อม</p>
-                        </div>
-                      )}
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
-
-                {/* Stock Summary */}
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <Package className="w-5 h-5" />
-                      สรุปสต็อกคงคลัง
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <ScrollArea className="h-48">
-                      {Object.keys(stockSummary).length > 0 ? (
-                        <div className="space-y-2">
-                          {Object.entries(stockSummary).map(([name, qty]) => (
-                            <div key={name} className="flex justify-between items-center p-2 rounded bg-muted/30">
-                              <span className="text-sm font-medium">{name}</span>
-                              <Badge variant={qty > 10 ? "default" : qty > 5 ? "secondary" : "destructive"}>
-                                {qty} ชิ้น
+                            <div className="flex flex-col items-end gap-1">
+                              <Badge variant="secondary">฿{job.estimatedPrice?.toLocaleString() || 0}</Badge>
+                              <Badge variant={job.status === "completed" ? "default" : "outline"}>
+                                {job.status === "completed" ? "เสร็จสิ้น" : "กำลังดำเนินการ"}
                               </Badge>
                             </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="text-center py-8 text-muted-foreground">
-                          <Package className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                          <p className="text-sm">ไม่มีสินค้าในสต็อก</p>
-                        </div>
-                      )}
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
-              </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-8 text-muted-foreground">
+                        <Wrench className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                        <p className="text-sm">ยังไม่มีรายการซ่อม</p>
+                      </div>
+                    )}
+                  </ScrollArea>
+                </CardContent>
+              </Card>
             </div>
           </div>
         )}
@@ -622,14 +538,9 @@ export default function IProDashboard() {
                   <DialogContent className="max-w-2xl">
                     <DialogHeader>
                       <DialogTitle>เพิ่มรายการซ่อม</DialogTitle>
-                      <DialogDescription>กรอกรายละเอียดงานซ่อมและเลือกอุปกรณ์ที่ใช้</DialogDescription>
+                      <DialogDescription>กรอกรายละเอียดงานซ่อมและข้อมูลลูกค้า</DialogDescription>
                     </DialogHeader>
-                    <RepairJobForm
-                      selectedBranchStock={selectedBranchStock}
-                      onSubmit={handleAddOrUpdateRepairJob}
-                      onClose={closeModal}
-                      error={modalError}
-                    />
+                    <RepairJobForm onSubmit={handleAddOrUpdateRepairJob} onClose={closeModal} error={modalError} />
                   </DialogContent>
                 </Dialog>
                 <Button variant="outline" onClick={() => setCurrentPage("stock_management")}>
@@ -640,14 +551,18 @@ export default function IProDashboard() {
             </div>
 
             {/* Branch Stats */}
-            <div className="grid gap-4 md:grid-cols-3">
+            <div className="grid gap-4 md:grid-cols-4">
               <Card>
                 <CardHeader className="pb-2">
                   <CardTitle className="text-sm font-medium">รายได้สาขานี้</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="text-2xl font-bold">
-                    ฿{selectedBranchJobs.reduce((sum, job) => sum + (job.price || 0), 0).toLocaleString()}
+                    ฿
+                    {selectedBranchJobs
+                      .filter((job) => job.status === "completed")
+                      .reduce((sum, job) => sum + (job.estimatedPrice || 0), 0)
+                      .toLocaleString()}
                   </div>
                 </CardContent>
               </Card>
@@ -661,10 +576,22 @@ export default function IProDashboard() {
               </Card>
               <Card>
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-medium">รายการสต็อก</CardTitle>
+                  <CardTitle className="text-sm font-medium">งานเสร็จสิ้น</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <div className="text-2xl font-bold">{selectedBranchStock.length}</div>
+                  <div className="text-2xl font-bold">
+                    {selectedBranchJobs.filter((job) => job.status === "completed").length}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium">กำลังดำเนินการ</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">
+                    {selectedBranchJobs.filter((job) => job.status === "in_progress").length}
+                  </div>
                 </CardContent>
               </Card>
             </div>
@@ -682,27 +609,53 @@ export default function IProDashboard() {
                       <Card key={job.id}>
                         <CardContent className="p-4">
                           <div className="flex justify-between items-start">
-                            <div className="space-y-2">
-                              <div className="flex items-center gap-2">
-                                <h4 className="font-semibold">{job.description}</h4>
-                                <Badge variant="secondary">฿{job.price?.toLocaleString() || 0}</Badge>
+                            <div className="space-y-2 flex-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <h4 className="font-semibold">{job.customerName}</h4>
+                                <Badge variant="secondary">฿{job.estimatedPrice?.toLocaleString() || 0}</Badge>
+                                <Badge variant={job.status === "completed" ? "default" : "outline"}>
+                                  {job.status === "completed" ? "เสร็จสิ้น" : "กำลังดำเนินการ"}
+                                </Badge>
+                                {job.isUnderWarranty && <Badge variant="destructive">ประกัน</Badge>}
                               </div>
-                              {job.itemsUsed.length > 0 && (
-                                <div className="text-sm text-muted-foreground">
-                                  <span className="font-medium">อุปกรณ์ที่ใช้: </span>
-                                  {job.itemsUsed.map((item, index) => (
-                                    <span key={item.stockId}>
-                                      {item.name} ({item.quantity} ชิ้น)
-                                      {index < job.itemsUsed.length - 1 && ", "}
-                                    </span>
-                                  ))}
-                                </div>
-                              )}
-                              <p className="text-xs text-muted-foreground">
-                                {new Date(job.createdAt).toLocaleString("th-TH")}
-                              </p>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm text-muted-foreground">
+                                <p>
+                                  <span className="font-medium">อาการ:</span> {job.symptoms}
+                                </p>
+                                <p>
+                                  <span className="font-medium">ช่างซ่อม:</span> {job.technicianName}
+                                </p>
+                                <p>
+                                  <span className="font-medium">วันที่รับ:</span>{" "}
+                                  {new Date(job.dateReceived).toLocaleDateString("th-TH")}
+                                </p>
+                                <p>
+                                  <span className="font-medium">คาดเสร็จ:</span>{" "}
+                                  {new Date(job.expectedCompletionDate).toLocaleDateString("th-TH")}
+                                </p>
+                              </div>
                             </div>
-                            <div className="flex gap-1">
+                            <div className="flex gap-1 ml-4">
+                              {job.status === "in_progress" && (
+                                <Button variant="outline" size="sm" onClick={() => handleCompleteRepair(job)}>
+                                  <CheckCircle className="w-4 h-4" />
+                                </Button>
+                              )}
+                              {job.status === "completed" && (
+                                <Dialog>
+                                  <DialogTrigger asChild>
+                                    <Button variant="outline" size="sm">
+                                      <FileText className="w-4 h-4" />
+                                    </Button>
+                                  </DialogTrigger>
+                                  <DialogContent className="max-w-md">
+                                    <DialogHeader>
+                                      <DialogTitle>ใบแจ้งซ่อมออนไลน์</DialogTitle>
+                                    </DialogHeader>
+                                    <RepairReceipt job={job} branch={selectedBranch} />
+                                  </DialogContent>
+                                </Dialog>
+                              )}
                               <Dialog>
                                 <DialogTrigger asChild>
                                   <Button variant="ghost" size="sm">
@@ -714,7 +667,6 @@ export default function IProDashboard() {
                                     <DialogTitle>แก้ไขรายการซ่อม</DialogTitle>
                                   </DialogHeader>
                                   <RepairJobForm
-                                    selectedBranchStock={selectedBranchStock}
                                     onSubmit={handleAddOrUpdateRepairJob}
                                     onClose={closeModal}
                                     error={modalError}
@@ -732,8 +684,7 @@ export default function IProDashboard() {
                                   <DialogHeader>
                                     <DialogTitle>ยืนยันการลบ</DialogTitle>
                                     <DialogDescription>
-                                      คุณแน่ใจหรือไม่ว่าต้องการลบรายการซ่อม "{job.description}"?
-                                      การกระทำนี้จะคืนสต็อกสินค้าที่ใช้ไปกลับเข้าระบบ
+                                      คุณแน่ใจหรือไม่ว่าต้องการลบรายการซ่อมของ "{job.customerName}"?
                                     </DialogDescription>
                                   </DialogHeader>
                                   <div className="flex justify-end gap-2">
@@ -970,94 +921,141 @@ const StockForm: FC<{
 }
 
 const RepairJobForm: FC<{
-  selectedBranchStock: StockItem[]
-  onSubmit: (description: string, price: number, itemsUsed: UsedItem[], job?: RepairJob) => void
+  onSubmit: (repairData: Omit<RepairJob, "id" | "branchId" | "createdAt">, job?: RepairJob) => void
   onClose: () => void
   error?: string
   initialData?: RepairJob
-}> = ({ selectedBranchStock, onSubmit, onClose, error, initialData }) => {
-  const [description, setDescription] = useState(initialData?.description || "")
-  const [price, setPrice] = useState(initialData?.price || 0)
-  const [itemsUsed, setItemsUsed] = useState<UsedItem[]>(initialData?.itemsUsed || [])
-
-  const handleItemUsageChange = (stockItem: StockItem, quantity: number) => {
-    const safeQuantity = Math.max(0, Math.min(quantity, stockItem.quantity))
-
-    setItemsUsed((prev) => {
-      if (safeQuantity === 0) {
-        return prev.filter((i) => i.stockId !== stockItem.id)
-      }
-      const rest = prev.filter((i) => i.stockId !== stockItem.id)
-      return [...rest, { stockId: stockItem.id, name: stockItem.name, quantity: safeQuantity }]
-    })
-  }
+}> = ({ onSubmit, onClose, error, initialData }) => {
+  const [customerName, setCustomerName] = useState(initialData?.customerName || "")
+  const [dateReceived, setDateReceived] = useState(initialData?.dateReceived || new Date().toISOString().split("T")[0])
+  const [symptoms, setSymptoms] = useState(initialData?.symptoms || "")
+  const [estimatedPrice, setEstimatedPrice] = useState(initialData?.estimatedPrice || 0)
+  const [isUnderWarranty, setIsUnderWarranty] = useState(initialData?.isUnderWarranty || false)
+  const [technicianName, setTechnicianName] = useState(initialData?.technicianName || "")
+  const [expectedCompletionDate, setExpectedCompletionDate] = useState(
+    initialData?.expectedCompletionDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
+  )
+  const [status, setStatus] = useState<"in_progress" | "completed">(initialData?.status || "in_progress")
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault()
-    if (description.trim() && price >= 0) {
-      onSubmit(description.trim(), price, itemsUsed, initialData)
+    if (customerName.trim() && symptoms.trim() && technicianName.trim()) {
+      onSubmit(
+        {
+          customerName: customerName.trim(),
+          dateReceived,
+          symptoms: symptoms.trim(),
+          estimatedPrice,
+          isUnderWarranty,
+          technicianName: technicianName.trim(),
+          expectedCompletionDate,
+          status,
+        },
+        initialData,
+      )
     }
   }
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="customer-name">ชื่อลูกค้า *</Label>
+          <Input
+            id="customer-name"
+            value={customerName}
+            onChange={(e) => setCustomerName(e.target.value)}
+            placeholder="กรอกชื่อลูกค้า"
+            required
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="date-received">วันที่รับแจ้ง *</Label>
+          <Input
+            id="date-received"
+            type="date"
+            value={dateReceived}
+            onChange={(e) => setDateReceived(e.target.value)}
+            required
+          />
+        </div>
+      </div>
+
       <div className="space-y-2">
-        <Label htmlFor="repair-description">รายละเอียดงานซ่อม</Label>
-        <Input
-          id="repair-description"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="เช่น เปลี่ยนหน้าจอ iPhone 12"
+        <Label htmlFor="symptoms">อาการ/ปัญหา *</Label>
+        <Textarea
+          id="symptoms"
+          value={symptoms}
+          onChange={(e) => setSymptoms(e.target.value)}
+          placeholder="อธิบายอาการหรือปัญหาที่พบ"
           required
         />
       </div>
 
-      <div className="space-y-2">
-        <Label htmlFor="repair-price">ราคาซ่อม (บาท)</Label>
-        <Input
-          id="repair-price"
-          type="number"
-          value={price}
-          onChange={(e) => setPrice(Number(e.target.value))}
-          placeholder="0"
-          min="0"
-          required
-        />
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="estimated-price">ราคาประเมิน (บาท) *</Label>
+          <Input
+            id="estimated-price"
+            type="number"
+            value={estimatedPrice}
+            onChange={(e) => setEstimatedPrice(Number(e.target.value))}
+            placeholder="0"
+            min="0"
+            required
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="warranty-status">สถานะประกัน</Label>
+          <Select value={isUnderWarranty ? "yes" : "no"} onValueChange={(value) => setIsUnderWarranty(value === "yes")}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="no">ไม่อยู่ในประกัน</SelectItem>
+              <SelectItem value="yes">อยู่ในประกัน</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="technician-name">ชื่อช่างซ่อม *</Label>
+          <Input
+            id="technician-name"
+            value={technicianName}
+            onChange={(e) => setTechnicianName(e.target.value)}
+            placeholder="กรอกชื่อช่างซ่อม"
+            required
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="expected-completion">วันคาดการเสร็จ *</Label>
+          <Input
+            id="expected-completion"
+            type="date"
+            value={expectedCompletionDate}
+            onChange={(e) => setExpectedCompletionDate(e.target.value)}
+            required
+          />
+        </div>
       </div>
 
       <div className="space-y-2">
-        <Label>อุปกรณ์ที่ใช้</Label>
-        <ScrollArea className="h-48 border rounded-md p-3">
-          {selectedBranchStock.length > 0 ? (
-            <div className="space-y-3">
-              {selectedBranchStock.map((item) => {
-                const itemInUse = itemsUsed.find((i) => i.stockId === item.id)
-                const availableQty = item.quantity + (itemInUse?.quantity || 0)
-
-                return (
-                  <div key={item.id} className="flex items-center justify-between p-2 rounded bg-muted/50">
-                    <div>
-                      <p className="font-medium text-sm">{item.name}</p>
-                      <p className="text-xs text-muted-foreground">มี {availableQty} ชิ้น</p>
-                    </div>
-                    <div className="w-20">
-                      <Input
-                        type="number"
-                        min={0}
-                        max={availableQty}
-                        value={itemInUse?.quantity || 0}
-                        onChange={(e) => handleItemUsageChange(item, Number(e.target.value))}
-                        className="text-center"
-                      />
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <p className="text-center text-muted-foreground py-4">ไม่มีสินค้าในสต็อก</p>
-          )}
-        </ScrollArea>
+        <Label htmlFor="repair-status">สถานะการซ่อม</Label>
+        <Select value={status} onValueChange={(value: "in_progress" | "completed") => setStatus(value)}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="in_progress">กำลังดำเนินการ</SelectItem>
+            <SelectItem value="completed">เสร็จสิ้น</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {error && (
@@ -1074,5 +1072,97 @@ const RepairJobForm: FC<{
         <Button type="submit">บันทึก</Button>
       </div>
     </form>
+  )
+}
+
+const RepairReceipt: FC<{
+  job: RepairJob
+  branch: Branch
+}> = ({ job, branch }) => {
+  const handlePrint = () => {
+    window.print()
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="text-center border-b pb-4">
+        <h3 className="text-lg font-bold">ใบแจ้งซ่อมออนไลน์</h3>
+        <p className="text-sm text-muted-foreground">{branch.name}</p>
+      </div>
+
+      <div className="space-y-3 text-sm">
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">ชื่อลูกค้า:</span>
+          </div>
+          <div>{job.customerName}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">วันที่รับแจ้ง:</span>
+          </div>
+          <div>{new Date(job.dateReceived).toLocaleDateString("th-TH")}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">อาการ:</span>
+          </div>
+          <div>{job.symptoms}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">ราคา:</span>
+          </div>
+          <div>฿{job.estimatedPrice.toLocaleString()}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">ประกัน:</span>
+          </div>
+          <div>{job.isUnderWarranty ? "อยู่ในประกัน" : "ไม่อยู่ในประกัน"}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">ช่างซ่อม:</span>
+          </div>
+          <div>{job.technicianName}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">วันคาดเสร็จ:</span>
+          </div>
+          <div>{new Date(job.expectedCompletionDate).toLocaleDateString("th-TH")}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <span className="font-medium">สถานะ:</span>
+          </div>
+          <div>
+            <Badge variant={job.status === "completed" ? "default" : "outline"}>
+              {job.status === "completed" ? "เสร็จสิ้น" : "กำลังดำเนินการ"}
+            </Badge>
+          </div>
+        </div>
+      </div>
+
+      <div className="text-center text-xs text-muted-foreground border-t pt-4">
+        <p>ขอบคุณที่ใช้บริการ</p>
+        <p>พิมพ์เมื่อ: {new Date().toLocaleString("th-TH")}</p>
+      </div>
+
+      <div className="flex justify-end">
+        <Button onClick={handlePrint} size="sm">
+          <FileText className="w-4 h-4 mr-2" />
+          พิมพ์ใบแจ้งซ่อม
+        </Button>
+      </div>
+    </div>
   )
 }
